@@ -216,62 +216,68 @@ def normalize_token(token):
     return token
 
 
-def get_region_jwt(region="VN"):
-    pool_key = "VN"
+def is_token_valid(token, min_ttl=60):
+    """Kiểm tra token còn hạn sống tối thiểu min_ttl giây không bằng cách đọc exp từ payload JWT"""
+    if not token:
+        return False
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        import base64
+        import json
+        payload_b64 = parts[1]
+        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+        exp = payload.get("exp", 0)
+        return exp > (time.time() + min_ttl)
+    except Exception:
+        return True
+
+
+def get_next_bot_token():
+    """Lấy token của bot tiếp theo theo cơ chế Round-Robin, tự động lấy token mới nếu hết hạn"""
     accounts = REGION_ACCOUNTS.get("VN", [])
+    if not accounts:
+        raise Exception("Danh sách REGION_ACCOUNTS['VN'] đang trống.")
+
     cycle_pool = region_cycles.get("VN")
     c_lock = cycle_locks.get("VN", jwt_lock)
 
-    max_attempts = len(accounts) if accounts else 1
+    max_attempts = len(accounts)
     for attempt in range(max_attempts):
         with c_lock:
             account = next(cycle_pool)
 
-        # 1. Nếu trong data acc đã có sẵn jwt_token còn dùng được thì ưu tiên dùng ngay
-        direct_token = account.get("jwt_token")
-        if direct_token:
-            return normalize_token(direct_token)
+        token = account.get("jwt_token")
+        # Nếu token sẵn có và còn hạn thì dùng luôn
+        if token and is_token_valid(token):
+            return normalize_token(token)
 
-        # 2. Nếu không có jwt_token sẵn thì mới gọi API đổi token bằng uid/password
+        # Nếu không có hoặc token đã hết hạn, tự động đăng nhập lấy token mới
         uid = account.get("uid")
         password = account.get("password")
-
         if not uid or not password:
             continue
 
         try:
+            logger.info("[VN] Đang lấy lại JWT token mới cho bot UID: %s...", uid)
             response = http_session.get(
                 JWT_API_URL,
                 params={"uid": uid, "password": password},
                 timeout=10
             )
             response.raise_for_status()
-            token = extract_token(response.json())
-            if token:
-                return normalize_token(token)
-            logger.warning("[VN] No token returned for UID: %s (attempt %d/%d)", uid, attempt + 1, max_attempts)
+            new_token = extract_token(response.json())
+            if new_token:
+                normalized = normalize_token(new_token)
+                account["jwt_token"] = normalized  # Lưu lại vào cache của account này
+                return normalized
+            logger.warning("[VN] Không nhận được token cho UID: %s (lần thử %d/%d)", uid, attempt + 1, max_attempts)
         except requests.exceptions.RequestException as e:
-            logger.warning("[VN] JWT provider error for UID %s: %s (attempt %d/%d)", uid, e, attempt + 1, max_attempts)
+            logger.warning("[VN] Lỗi lấy JWT cho UID %s: %s (lần thử %d/%d)", uid, e, attempt + 1, max_attempts)
 
-    raise Exception("Không thể lấy JWT token cho server VN. Vui lòng kiểm tra lại tài khoản bot trong REGION_ACCOUNTS['VN'].")
-
-
-def ensure_jwt_token_sync(region="VN", force_refresh=False):
-    region = "VN"
-    now = time.time()
-
-    if not force_refresh and region in jwt_tokens and now < jwt_expiry.get(region, 0):
-        return jwt_tokens[region]
-
-    with jwt_lock:
-        now = time.time()
-        if not force_refresh and region in jwt_tokens and now < jwt_expiry.get(region, 0):
-            return jwt_tokens[region]
-
-        token = get_region_jwt(region)
-        jwt_tokens[region] = token
-        jwt_expiry[region] = time.time() + JWT_CACHE_SECONDS
-        return token
+    raise Exception("Không thể lấy JWT token hợp lệ từ bất kỳ bot nào trong danh sách REGION_ACCOUNTS['VN'].")
 
 
 def get_api_endpoint(region="VN"):
@@ -316,7 +322,7 @@ def make_headers(token):
 
 
 
-def apis(encrypted_hex, region, override_token=None):
+def apis(encrypted_hex, region="VN", override_token=None):
     region = (region or "VN").upper()
     endpoint = get_api_endpoint(region)
 
@@ -331,8 +337,11 @@ def apis(encrypted_hex, region, override_token=None):
         response.raise_for_status()
         return response.content.hex()
 
-    for attempt in range(2):
-        token = ensure_jwt_token_sync(region, force_refresh=(attempt > 0))
+    accounts_count = len(REGION_ACCOUNTS.get("VN", []))
+    max_retries = max(accounts_count, 2)
+
+    for attempt in range(max_retries):
+        token = get_next_bot_token()
         headers = make_headers(token)
         try:
             response = http_session.post(
@@ -342,16 +351,14 @@ def apis(encrypted_hex, region, override_token=None):
                 timeout=8
             )
             if response.status_code in [401, 429]:
-                logger.warning("[%s] Received status %s, rotating account...", region, response.status_code)
-                jwt_tokens.pop(region, None)
-                jwt_expiry.pop(region, None)
+                logger.warning("[VN] Token gặp status %s, tự động chuyển sang bot tiếp theo (lần %d/%d)...", response.status_code, attempt + 1, max_retries)
                 continue
             response.raise_for_status()
             return response.content.hex()
         except requests.exceptions.RequestException:
-            if attempt == 1:
+            if attempt == max_retries - 1:
                 raise
-    raise Exception(f"API request failed for region {region} after rotation attempts")
+    raise Exception(f"API request failed for region {region} after {max_retries} bot attempts")
 
 
 def add_metadata(result, start_time):
